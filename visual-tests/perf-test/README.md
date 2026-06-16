@@ -6,8 +6,9 @@ stroke-only `rectangle` path to test whether Rust speeds up generation.
 ## Files
 
 - `rectangle.html` — JS-only: generate + draw 6000 rectangles, averaged over 10 runs.
-- `compare.html` — JS rough.js generation vs Rust/WASM generation over the same inputs.
-- `rough-wasm/` — the Rust crate (port of `src/renderer.ts` rectangle path).
+- `compare.html` — rectangle: JS rough.js vs JS flat-buffer vs Rust/WASM, same inputs.
+- `ellipse.html` — ellipse: same five-way comparison as `compare.html`.
+- `rough-wasm/` — the Rust crate (port of `src/renderer.ts` rectangle + ellipse paths).
 
 ## Build the WASM module
 

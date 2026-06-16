@@ -1,0 +1,4 @@
+- [x] rectangle
+- [x] ellipse
+- [ ] rectangle test (for both original and new)
+- [ ] ellipse test (for both original and new)
