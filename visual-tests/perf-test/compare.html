@@ -96,6 +96,92 @@
         ctx.restore();
       }
 
+      // Park-Miller LCG, identical to src/math.ts and the Rust port.
+      class FlatRandom {
+        constructor(seed) {
+          this.seed = seed;
+        }
+        next() {
+          this.seed = Math.imul(48271, this.seed);
+          return (this.seed & 0x7fffffff) / 2147483648;
+        }
+      }
+
+      // Pure-JS baseline: same rectangle algorithm as rough.js, but writes ops into a
+      // preallocated flat Float64Array (stride 7) with NO object graph. Isolates
+      // "Rust/WASM speed" from "flat buffer vs per-op object allocation". Returns the
+      // number of floats written. Mirrors rough-wasm/src/lib.rs line-for-line.
+      function genFlatJS(rects, buf, o, seed) {
+        const rng = new FlatRandom(seed);
+        const count = rects.length / 4;
+        let p = 0;
+
+        const offset = (min, max, rg) =>
+          o.roughness * rg * (rng.next() * (max - min) + min);
+        const offsetOpt = (x, rg) => offset(-x, x, rg);
+
+        function line(x1, y1, x2, y2, doMove, overlay) {
+          const lengthSq = (x1 - x2) ** 2 + (y1 - y2) ** 2;
+          const length = Math.sqrt(lengthSq);
+          let rg;
+          if (length < 200) rg = 1;
+          else if (length > 500) rg = 0.4;
+          else rg = -0.0016668 * length + 1.233334;
+
+          let off = o.maxRandomnessOffset;
+          if (off * off * 100 > lengthSq) off = length / 10;
+          const halfOffset = off / 2;
+          const divergePoint = 0.2 + rng.next() * 0.2;
+
+          let midDispX = (o.bowing * o.maxRandomnessOffset * (y2 - y1)) / 200;
+          let midDispY = (o.bowing * o.maxRandomnessOffset * (x1 - x2)) / 200;
+          midDispX = offsetOpt(midDispX, rg);
+          midDispY = offsetOpt(midDispY, rg);
+
+          const pv = o.preserveVertices;
+
+          if (doMove) {
+            const r = overlay ? halfOffset : off;
+            buf[p] = OP_MOVE;
+            buf[p + 1] = x1 + (pv ? 0 : offsetOpt(r, rg));
+            buf[p + 2] = y1 + (pv ? 0 : offsetOpt(r, rg));
+            buf[p + 3] = 0;
+            buf[p + 4] = 0;
+            buf[p + 5] = 0;
+            buf[p + 6] = 0;
+            p += 7;
+          }
+
+          const r = overlay ? halfOffset : off;
+          buf[p] = OP_BCURVE;
+          buf[p + 1] = midDispX + x1 + (x2 - x1) * divergePoint + offsetOpt(r, rg);
+          buf[p + 2] = midDispY + y1 + (y2 - y1) * divergePoint + offsetOpt(r, rg);
+          buf[p + 3] = midDispX + x1 + 2 * (x2 - x1) * divergePoint + offsetOpt(r, rg);
+          buf[p + 4] = midDispY + y1 + 2 * (y2 - y1) * divergePoint + offsetOpt(r, rg);
+          buf[p + 5] = x2 + (pv ? 0 : offsetOpt(r, rg));
+          buf[p + 6] = y2 + (pv ? 0 : offsetOpt(r, rg));
+          p += 7;
+        }
+
+        function doubleLine(x1, y1, x2, y2) {
+          line(x1, y1, x2, y2, true, false);
+          if (!o.disableMultiStroke) line(x1, y1, x2, y2, true, true);
+        }
+
+        for (let i = 0; i < count; i++) {
+          const b = i * 4;
+          const x = rects[b];
+          const y = rects[b + 1];
+          const x2 = x + rects[b + 2];
+          const y2 = y + rects[b + 3];
+          doubleLine(x, y, x2, y);
+          doubleLine(x2, y, x2, y2);
+          doubleLine(x2, y2, x, y2);
+          doubleLine(x, y2, x, y); // close
+        }
+        return p;
+      }
+
       function randomRects() {
         // Flat [x, y, w, h, ...] buffer shared by both implementations.
         const rects = new Float64Array(COUNT * 4);
@@ -117,10 +203,21 @@
         await init();
 
         const jsTimes = [];
+        const jsFlatTimes = [];
         const wasmFullTimes = [];
         const wasmViewTimes = [];
         const wasmPureTimes = [];
         let lastView = null;
+
+        // Reused flat output buffer for the JS baseline (same as the Rust buffer).
+        const flatBuf = new Float64Array(COUNT * 16 * OP_STRIDE);
+        const oFlat = {
+          roughness: ROUGHNESS,
+          maxRandomnessOffset: MAX_RAND,
+          bowing: BOWING,
+          preserveVertices: PRESERVE_VERTICES,
+          disableMultiStroke: DISABLE_MULTI_STROKE,
+        };
 
         for (let r = 0; r < RUNS; r++) {
           const rects = randomRects();
@@ -147,6 +244,11 @@
             );
           }
           jsTimes.push(performance.now() - jsStart);
+
+          // --- JS flat buffer: same algorithm, written into a flat Float64Array ---
+          const flatStart = performance.now();
+          genFlatJS(rects, flatBuf, oFlat, SEED);
+          jsFlatTimes.push(performance.now() - flatStart);
 
           // --- WASM: full generation, COPIES the op buffer across the boundary ---
           const wasmStart = performance.now();
@@ -195,6 +297,7 @@
         drawOpBuffer(ctx, lastView);
 
         const js = avg(jsTimes);
+        const jf = avg(jsFlatTimes);
         const wf = avg(wasmFullTimes);
         const wv = avg(wasmViewTimes);
         const wp = avg(wasmPureTimes);
@@ -202,21 +305,26 @@
         const speedup = (base, other) => (base / other).toFixed(2) + "x";
 
         const report = [
-          `Rectangles:        ${COUNT}`,
-          `Runs:              ${RUNS} (averaged)`,
-          `Seed:              ${SEED} (both use Park-Miller LCG)`,
+          `Rectangles:          ${COUNT}`,
+          `Runs:                ${RUNS} (averaged)`,
+          `Seed:                ${SEED} (all use Park-Miller LCG)`,
           ``,
-          `JS rough.js gen:   ${js.toFixed(2)} ms  (${(js / COUNT).toFixed(4)} ms/rect)`,
-          `WASM gen (copy):   ${wf.toFixed(2)} ms  (${(wf / COUNT).toFixed(4)} ms/rect)  -> ${speedup(js, wf)} vs JS`,
-          `WASM gen (view):   ${wv.toFixed(2)} ms  (${(wv / COUNT).toFixed(4)} ms/rect)  -> ${speedup(js, wv)} vs JS`,
-          `WASM gen (pure):   ${wp.toFixed(2)} ms  (${(wp / COUNT).toFixed(4)} ms/rect)  -> ${speedup(js, wp)} vs JS`,
+          `JS rough.js (objs):  ${js.toFixed(2)} ms  (${(js / COUNT).toFixed(4)} ms/rect)`,
+          `JS flat Float64Arr:  ${jf.toFixed(2)} ms  (${(jf / COUNT).toFixed(4)} ms/rect)  -> ${speedup(js, jf)} vs rough.js`,
+          `WASM gen (copy):     ${wf.toFixed(2)} ms  (${(wf / COUNT).toFixed(4)} ms/rect)  -> ${speedup(js, wf)} vs rough.js`,
+          `WASM gen (view):     ${wv.toFixed(2)} ms  (${(wv / COUNT).toFixed(4)} ms/rect)  -> ${speedup(js, wv)} vs rough.js`,
+          `WASM gen (pure):     ${wp.toFixed(2)} ms  (${(wp / COUNT).toFixed(4)} ms/rect)  -> ${speedup(js, wp)} vs rough.js`,
           ``,
+          `The honest language comparison is WASM view vs JS flat: ${speedup(jf, wv)} (same flat-buffer output shape).`,
+          `The rough.js -> JS flat gap (${speedup(js, jf)}) is the object-graph/GC cost, not language.`,
+          ``,
+          `  "JS flat" writes the same ops into a reused flat Float64Array, no per-op objects.`,
           `  "copy" returns a Vec<f64> -> wasm-bindgen copies ~${(COUNT * 16 * 7).toLocaleString()} floats out.`,
           `  "view" returns a Float64Array view over WASM memory (zero output copy).`,
           `  "pure" measures only the generation algorithm (checksum returned).`,
-          `  All three still copy the small ${(COUNT * 4).toLocaleString()}-float input in.`,
           ``,
-          `JS runs:   ${jsTimes.map((t) => t.toFixed(1)).join(", ")}`,
+          `rough.js:  ${jsTimes.map((t) => t.toFixed(1)).join(", ")}`,
+          `JS flat:   ${jsFlatTimes.map((t) => t.toFixed(1)).join(", ")}`,
           `WASM copy: ${wasmFullTimes.map((t) => t.toFixed(1)).join(", ")}`,
           `WASM view: ${wasmViewTimes.map((t) => t.toFixed(1)).join(", ")}`,
           `WASM pure: ${wasmPureTimes.map((t) => t.toFixed(1)).join(", ")}`,
