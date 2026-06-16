@@ -1,10 +1,10 @@
-import { Config, Options, Drawable, OpSet, Op, ResolvedOptions, PathInfo } from './core.js';
-import { Point } from './geometry.js';
-import { line, solidFillPolygon, patternFillPolygons, rectangle, ellipseWithParams, generateEllipseParams, linearPath, arc, patternFillArc, curve, svgPath } from './renderer.js';
-import { randomSeed } from './math.js';
-import { curveToBezier } from 'points-on-curve/lib/curve-to-bezier.js';
 import { pointsOnBezierCurves } from 'points-on-curve';
+import { curveToBezier } from 'points-on-curve/lib/curve-to-bezier.js';
 import { pointsOnPath } from 'points-on-path';
+import { Config, Drawable, Op, OpSet, Options, PathInfo, ResolvedOptions } from './core.js';
+import { Point } from './geometry.js';
+import { randomSeed } from './math.js';
+import { arc, curve, ellipseWithParams, generateEllipseParams, line, linearPath, patternFillArc, patternFillPolygons, rectangle, solidFillPolygon, svgPath } from './renderer.js';
 
 const NOS = 'none';
 

@@ -78,7 +78,6 @@ export interface OpSet {
   type: OpSetType;
   ops: Op[];
   size?: Point;
-  path?: string;
 }
 
 export interface Drawable {
