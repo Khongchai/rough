@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, minimum-scale=1, initial-scale=1, user-scalable=yes"
+    />
+    <title>RoughJS Rectangle Perf: JS vs Rust/WASM</title>
+    <style>
+      html {
+        background: black;
+      }
+      body {
+        font-family: monospace;
+        background: black;
+        color: white;
+      }
+      #results {
+        white-space: pre;
+        margin-bottom: 12px;
+        line-height: 1.4;
+      }
+      .win {
+        color: #6cf;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="results">Loading WASM…</div>
+    <canvas width="800" height="800"></canvas>
+
+    <script type="module">
+      import rough from "../../bundled/rough.esm.js";
+      import init, {
+        generate_rectangles,
+        generate_rectangles_view,
+        bench_generate,
+      } from "./rough-wasm/pkg/rough_wasm.js";
+
+      const COUNT = 6000;
+      const RUNS = 10;
+      const WIDTH = 800;
+      const HEIGHT = 800;
+      const SEED = 1; // both sides use the seeded Park-Miller LCG
+
+      const canvas = document.querySelector("canvas");
+      const ctx = canvas.getContext("2d");
+      const rc = rough.canvas(canvas);
+      const results = document.getElementById("results");
+
+      // Default RoughJS option values that the stroke-only rectangle path reads.
+      const ROUGHNESS = 1;
+      const MAX_RAND = 2;
+      const BOWING = 1;
+      const PRESERVE_VERTICES = false;
+      const DISABLE_MULTI_STROKE = false;
+
+      const avg = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
+
+      // Op buffer encoding (must match rough-wasm/src/lib.rs).
+      const OP_STRIDE = 7;
+      const OP_MOVE = 0;
+      const OP_BCURVE = 1;
+      const OP_LINE = 2;
+      const STROKE_WIDTH = 1; // rough.js default
+
+      // Decode the flat stride-7 f64 op buffer and stroke it. All rectangles share a
+      // style, so a single path/stroke over every subpath is visually equivalent to
+      // rough.js drawing each Drawable separately.
+      function drawOpBuffer(ctx, buf) {
+        ctx.clearRect(0, 0, WIDTH, HEIGHT);
+        ctx.save();
+        ctx.strokeStyle = "white";
+        ctx.lineWidth = STROKE_WIDTH;
+        ctx.beginPath();
+        for (let i = 0; i < buf.length; i += OP_STRIDE) {
+          const op = buf[i];
+          if (op === OP_MOVE) {
+            ctx.moveTo(buf[i + 1], buf[i + 2]);
+          } else if (op === OP_BCURVE) {
+            ctx.bezierCurveTo(
+              buf[i + 1],
+              buf[i + 2],
+              buf[i + 3],
+              buf[i + 4],
+              buf[i + 5],
+              buf[i + 6],
+            );
+          } else if (op === OP_LINE) {
+            ctx.lineTo(buf[i + 1], buf[i + 2]);
+          }
+        }
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      function randomRects() {
+        // Flat [x, y, w, h, ...] buffer shared by both implementations.
+        const rects = new Float64Array(COUNT * 4);
+        for (let i = 0; i < COUNT; i++) {
+          const w = 5 + Math.random() * 100;
+          const h = 5 + Math.random() * 100;
+          const x = Math.random() * (WIDTH - w);
+          const y = Math.random() * (HEIGHT - h);
+          const b = i * 4;
+          rects[b] = x;
+          rects[b + 1] = y;
+          rects[b + 2] = w;
+          rects[b + 3] = h;
+        }
+        return rects;
+      }
+
+      async function run() {
+        await init();
+
+        const jsTimes = [];
+        const wasmFullTimes = [];
+        const wasmViewTimes = [];
+        const wasmPureTimes = [];
+        let lastView = null;
+
+        for (let r = 0; r < RUNS; r++) {
+          const rects = randomRects();
+
+          // --- JS: rough.js generation (seeded so it uses the same LCG) ---
+          const opts = {
+            seed: SEED,
+            roughness: ROUGHNESS,
+            maxRandomnessOffset: MAX_RAND,
+            bowing: BOWING,
+            preserveVertices: PRESERVE_VERTICES,
+            disableMultiStroke: DISABLE_MULTI_STROKE,
+          };
+          const drawables = new Array(COUNT);
+          const jsStart = performance.now();
+          for (let i = 0; i < COUNT; i++) {
+            const b = i * 4;
+            drawables[i] = rc.generator.rectangle(
+              rects[b],
+              rects[b + 1],
+              rects[b + 2],
+              rects[b + 3],
+              opts,
+            );
+          }
+          jsTimes.push(performance.now() - jsStart);
+
+          // --- WASM: full generation, COPIES the op buffer across the boundary ---
+          const wasmStart = performance.now();
+          generate_rectangles(
+            rects,
+            ROUGHNESS,
+            MAX_RAND,
+            BOWING,
+            PRESERVE_VERTICES,
+            DISABLE_MULTI_STROKE,
+            SEED,
+          );
+          wasmFullTimes.push(performance.now() - wasmStart);
+
+          // --- WASM: pure compute, returns only a checksum (no buffer marshalled) ---
+          const pureStart = performance.now();
+          bench_generate(
+            rects,
+            ROUGHNESS,
+            MAX_RAND,
+            BOWING,
+            PRESERVE_VERTICES,
+            DISABLE_MULTI_STROKE,
+            SEED,
+          );
+          wasmPureTimes.push(performance.now() - pureStart);
+
+          // --- WASM: zero-copy view over WASM memory (no output copy). Must be the
+          // LAST wasm call in the loop so the final view stays valid for drawing. ---
+          const viewStart = performance.now();
+          const view = generate_rectangles_view(
+            rects,
+            ROUGHNESS,
+            MAX_RAND,
+            BOWING,
+            PRESERVE_VERTICES,
+            DISABLE_MULTI_STROKE,
+            SEED,
+          );
+          wasmViewTimes.push(performance.now() - viewStart);
+          lastView = view; // valid only until the next wasm call; we draw after the loop
+        }
+
+        // Draw straight from the Rust/WASM zero-copy view (not the JS drawables),
+        // decoding the flat stride-7 buffer exactly like rough.js's _drawToContext.
+        drawOpBuffer(ctx, lastView);
+
+        const js = avg(jsTimes);
+        const wf = avg(wasmFullTimes);
+        const wv = avg(wasmViewTimes);
+        const wp = avg(wasmPureTimes);
+
+        const speedup = (base, other) => (base / other).toFixed(2) + "x";
+
+        const report = [
+          `Rectangles:        ${COUNT}`,
+          `Runs:              ${RUNS} (averaged)`,
+          `Seed:              ${SEED} (both use Park-Miller LCG)`,
+          ``,
+          `JS rough.js gen:   ${js.toFixed(2)} ms  (${(js / COUNT).toFixed(4)} ms/rect)`,
+          `WASM gen (copy):   ${wf.toFixed(2)} ms  (${(wf / COUNT).toFixed(4)} ms/rect)  -> ${speedup(js, wf)} vs JS`,
+          `WASM gen (view):   ${wv.toFixed(2)} ms  (${(wv / COUNT).toFixed(4)} ms/rect)  -> ${speedup(js, wv)} vs JS`,
+          `WASM gen (pure):   ${wp.toFixed(2)} ms  (${(wp / COUNT).toFixed(4)} ms/rect)  -> ${speedup(js, wp)} vs JS`,
+          ``,
+          `  "copy" returns a Vec<f64> -> wasm-bindgen copies ~${(COUNT * 16 * 7).toLocaleString()} floats out.`,
+          `  "view" returns a Float64Array view over WASM memory (zero output copy).`,
+          `  "pure" measures only the generation algorithm (checksum returned).`,
+          `  All three still copy the small ${(COUNT * 4).toLocaleString()}-float input in.`,
+          ``,
+          `JS runs:   ${jsTimes.map((t) => t.toFixed(1)).join(", ")}`,
+          `WASM copy: ${wasmFullTimes.map((t) => t.toFixed(1)).join(", ")}`,
+          `WASM view: ${wasmViewTimes.map((t) => t.toFixed(1)).join(", ")}`,
+          `WASM pure: ${wasmPureTimes.map((t) => t.toFixed(1)).join(", ")}`,
+        ].join("\n");
+
+        results.textContent = report;
+        console.log(report);
+      }
+
+      run().catch((e) => {
+        results.textContent = "Error: " + e;
+        console.error(e);
+      });
+    </script>
+  </body>
+</html>
