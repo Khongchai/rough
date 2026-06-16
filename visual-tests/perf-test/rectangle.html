@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, minimum-scale=1, initial-scale=1, user-scalable=yes"
+    />
+    <title>RoughJS Rectangle Perf Test</title>
+    <style>
+      html {
+        background: black;
+      }
+      body {
+        font-family: monospace;
+        background: black;
+        color: white;
+      }
+      #results {
+        white-space: pre;
+        margin-bottom: 12px;
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="results">Running…</div>
+    <canvas width="800" height="800"></canvas>
+
+    <script type="module">
+      import rough from "../../bundled/rough.esm.js";
+
+      const COUNT = 6000;
+      const RUNS = 10;
+      const WIDTH = 800;
+      const HEIGHT = 800;
+
+      const canvas = document.querySelector("canvas");
+      const ctx = canvas.getContext("2d");
+      const rc = rough.canvas(canvas);
+      const results = document.getElementById("results");
+
+      const genTimes = [];
+      const drawTimes = [];
+
+      for (let run = 0; run < RUNS; run++) {
+        // Generate phase: build COUNT random rectangle drawables, store in array.
+        const drawables = new Array(COUNT);
+        const genStart = performance.now();
+        for (let i = 0; i < COUNT; i++) {
+          const w = 5 + Math.random() * 100;
+          const h = 5 + Math.random() * 100;
+          const x = Math.random() * (WIDTH - w);
+          const y = Math.random() * (HEIGHT - h);
+          drawables[i] = rc.generator.rectangle(x, y, w, h);
+        }
+        const genEnd = performance.now();
+        genTimes.push(genEnd - genStart);
+
+        // Draw phase: render all stored drawables onto the canvas.
+        ctx.clearRect(0, 0, WIDTH, HEIGHT);
+        const drawStart = performance.now();
+        for (let i = 0; i < COUNT; i++) {
+          rc.draw(drawables[i]);
+        }
+        const drawEnd = performance.now();
+        drawTimes.push(drawEnd - drawStart);
+      }
+
+      const avg = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
+      const genAvg = avg(genTimes);
+      const drawAvg = avg(drawTimes);
+      const totalAvg = genAvg + drawAvg;
+
+      const report = [
+        `Rectangles:    ${COUNT}`,
+        `Runs:          ${RUNS} (averaged)`,
+        ``,
+        `Generate:      ${genAvg.toFixed(2)} ms  (${(genAvg / COUNT).toFixed(4)} ms/rect)`,
+        `Draw:          ${drawAvg.toFixed(2)} ms  (${(drawAvg / COUNT).toFixed(4)} ms/rect)`,
+        `Total:         ${totalAvg.toFixed(2)} ms`,
+        ``,
+        `Generate runs: ${genTimes.map((t) => t.toFixed(1)).join(", ")}`,
+        `Draw runs:     ${drawTimes.map((t) => t.toFixed(1)).join(", ")}`,
+      ].join("\n");
+
+      results.textContent = report;
+      console.log(report);
+    </script>
+  </body>
+</html>
