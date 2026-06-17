@@ -10,6 +10,7 @@
 // Rebuild it with:
 //   cd visual-tests/perf-test/rough-wasm && npm run build:wasm-node
 
+import { parsePath, absolutize, normalize } from 'path-data-parser';
 import * as nodeWasm from '../visual-tests/perf-test/rough-wasm/pkg-node/rough_wasm.js';
 import {
   makeImpls,
@@ -20,14 +21,18 @@ import {
   OP_LINE,
   type FlatOptions,
   type ShapeImpl,
+  type LineImpl,
+  type PolygonImpl,
+  type PathImpl,
   type RoughWasmExports,
 } from '../visual-tests/perf-test/rough-wasm/core.js';
 import { OpSet, Options } from './core.js';
+import { Point } from './geometry.js';
 import { RoughGenerator } from './generator.js';
 
 // Re-export the package surface so the test files can import everything from here.
 export { DEFAULTS, OP_STRIDE, OP_MOVE, OP_BCURVE, OP_LINE };
-export type { FlatOptions, ShapeImpl };
+export type { FlatOptions, ShapeImpl, LineImpl, PolygonImpl, PathImpl };
 
 // --- rough.js reference (the oracle) ---
 
@@ -66,6 +71,20 @@ export function referenceRectangle(x: number, y: number, w: number, h: number, o
 
 export function referenceEllipse(x: number, y: number, w: number, h: number, o: FlatOptions, seed: number): Float64Array {
   return flatten(gen.ellipse(x, y, w, h, toOptions(o, seed)).sets);
+}
+
+export function referenceLine(x1: number, y1: number, x2: number, y2: number, o: FlatOptions, seed: number): Float64Array {
+  return flatten(gen.line(x1, y1, x2, y2, toOptions(o, seed)).sets);
+}
+
+export function referencePolygon(points: ArrayLike<number>, o: FlatOptions, seed: number): Float64Array {
+  const pts: Point[] = [];
+  for (let i = 0; i < points.length; i += 2) pts.push([points[i], points[i + 1]]);
+  return flatten(gen.polygon(pts, toOptions(o, seed)).sets);
+}
+
+export function referencePath(d: string, o: FlatOptions, seed: number): Float64Array {
+  return flatten(gen.path(d, toOptions(o, seed)).sets);
 }
 
 // --- WASM champion (zero-copy view). The package returns a transient view; the tests
@@ -233,6 +252,158 @@ function genEllipseFlatJS(x: number, y: number, w: number, h: number, o: FlatOpt
 const jsRect: ShapeImpl = { name: 'js-flat', generate: genRectangleFlatJS };
 const jsEllipse: ShapeImpl = { name: 'js-flat', generate: genEllipseFlatJS };
 
+// --- Shared flat-JS machine for the _doubleLine / _bezierTo based shapes ---
+
+interface LineMachine {
+  offsetOpt(v: number, rg: number): number;
+  doubleLine(x1: number, y1: number, x2: number, y2: number): void;
+  bezierTo(x1: number, y1: number, x2: number, y2: number, x: number, y: number, current: [number, number]): void;
+}
+
+function lineMachine(o: FlatOptions, rng: FlatRandom, out: number[]): LineMachine {
+  const offset = (min: number, max: number, rg: number) => o.roughness * rg * (rng.next() * (max - min) + min);
+  const offsetOpt = (v: number, rg: number) => offset(-v, v, rg);
+
+  function line(x1: number, y1: number, x2: number, y2: number, overlay: boolean) {
+    const lengthSq = (x1 - x2) ** 2 + (y1 - y2) ** 2;
+    const length = Math.sqrt(lengthSq);
+    let rg: number;
+    if (length < 200) rg = 1;
+    else if (length > 500) rg = 0.4;
+    else rg = -0.0016668 * length + 1.233334;
+
+    let off = o.maxRandomnessOffset;
+    if (off * off * 100 > lengthSq) off = length / 10;
+    const halfOffset = off / 2;
+    const divergePoint = 0.2 + rng.next() * 0.2;
+
+    let midDispX = (o.bowing * o.maxRandomnessOffset * (y2 - y1)) / 200;
+    let midDispY = (o.bowing * o.maxRandomnessOffset * (x1 - x2)) / 200;
+    midDispX = offsetOpt(midDispX, rg);
+    midDispY = offsetOpt(midDispY, rg);
+
+    const pv = o.preserveVertices;
+    const r = overlay ? halfOffset : off;
+
+    out.push(OP_MOVE, x1 + (pv ? 0 : offsetOpt(r, rg)), y1 + (pv ? 0 : offsetOpt(r, rg)), 0, 0, 0, 0);
+    out.push(
+      OP_BCURVE,
+      midDispX + x1 + (x2 - x1) * divergePoint + offsetOpt(r, rg),
+      midDispY + y1 + (y2 - y1) * divergePoint + offsetOpt(r, rg),
+      midDispX + x1 + 2 * (x2 - x1) * divergePoint + offsetOpt(r, rg),
+      midDispY + y1 + 2 * (y2 - y1) * divergePoint + offsetOpt(r, rg),
+      x2 + (pv ? 0 : offsetOpt(r, rg)),
+      y2 + (pv ? 0 : offsetOpt(r, rg))
+    );
+  }
+
+  function doubleLine(x1: number, y1: number, x2: number, y2: number) {
+    line(x1, y1, x2, y2, false);
+    if (!o.disableMultiStroke) line(x1, y1, x2, y2, true);
+  }
+
+  function bezierTo(x1: number, y1: number, x2: number, y2: number, x: number, y: number, current: [number, number]) {
+    const base = o.maxRandomnessOffset || 1;
+    const ros = [base, base + 0.3];
+    const iterations = o.disableMultiStroke ? 1 : 2;
+    const pv = o.preserveVertices;
+    for (let i = 0; i < iterations; i++) {
+      if (i === 0) {
+        out.push(OP_MOVE, current[0], current[1], 0, 0, 0, 0);
+      } else {
+        out.push(OP_MOVE, current[0] + (pv ? 0 : offsetOpt(ros[0], 1)), current[1] + (pv ? 0 : offsetOpt(ros[0], 1)), 0, 0, 0, 0);
+      }
+      const fx = pv ? x : x + offsetOpt(ros[i], 1);
+      const fy = pv ? y : y + offsetOpt(ros[i], 1);
+      out.push(
+        OP_BCURVE,
+        x1 + offsetOpt(ros[i], 1),
+        y1 + offsetOpt(ros[i], 1),
+        x2 + offsetOpt(ros[i], 1),
+        y2 + offsetOpt(ros[i], 1),
+        fx,
+        fy
+      );
+    }
+  }
+
+  return { offsetOpt, doubleLine, bezierTo };
+}
+
+function genLineFlatJS(x1: number, y1: number, x2: number, y2: number, o: FlatOptions, seed: number): Float64Array {
+  const out: number[] = [];
+  lineMachine(o, new FlatRandom(seed), out).doubleLine(x1, y1, x2, y2);
+  return new Float64Array(out);
+}
+
+function genPolygonFlatJS(points: ArrayLike<number>, o: FlatOptions, seed: number): Float64Array {
+  const out: number[] = [];
+  const m = lineMachine(o, new FlatRandom(seed), out);
+  const pts: [number, number][] = [];
+  for (let i = 0; i < points.length; i += 2) pts.push([points[i], points[i + 1]]);
+  const len = pts.length;
+  // linearPath(points, close=true)
+  if (len > 2) {
+    for (let i = 0; i < len - 1; i++) m.doubleLine(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]);
+    m.doubleLine(pts[len - 1][0], pts[len - 1][1], pts[0][0], pts[0][1]);
+  } else if (len === 2) {
+    m.doubleLine(pts[0][0], pts[0][1], pts[1][0], pts[1][1]);
+  }
+  return new Float64Array(out);
+}
+
+function genPathFlatJS(d: string, o: FlatOptions, seed: number): Float64Array {
+  const out: number[] = [];
+  if (!d) return new Float64Array(out);
+  // generator.path preprocessing (the third JS replace is a no-op bug, so omitted).
+  const pd = d.replace(/\n/g, ' ').replace(/(-\s)/g, '-');
+  const m = lineMachine(o, new FlatRandom(seed), out);
+  const segments = normalize(absolutize(parsePath(pd)));
+  let first: [number, number] = [0, 0];
+  let current: [number, number] = [0, 0];
+  for (const { key, data } of segments) {
+    switch (key) {
+      case 'M':
+        current = [data[0], data[1]];
+        first = [data[0], data[1]];
+        break;
+      case 'L':
+        m.doubleLine(current[0], current[1], data[0], data[1]);
+        current = [data[0], data[1]];
+        break;
+      case 'C':
+        m.bezierTo(data[0], data[1], data[2], data[3], data[4], data[5], current);
+        current = [data[4], data[5]];
+        break;
+      case 'Z':
+        m.doubleLine(current[0], current[1], first[0], first[1]);
+        current = [first[0], first[1]];
+        break;
+    }
+  }
+  return new Float64Array(out);
+}
+
+const jsLine: LineImpl = { name: 'js-flat', generate: genLineFlatJS };
+const jsPolygon: PolygonImpl = { name: 'js-flat', generate: genPolygonFlatJS };
+const jsPath: PathImpl = { name: 'js-flat', generate: genPathFlatJS };
+
+const slicedLine = (impl: LineImpl): LineImpl => ({
+  name: impl.name,
+  generate: (x1, y1, x2, y2, o, seed) => impl.generate(x1, y1, x2, y2, o, seed).slice(),
+});
+const slicedPolygon = (impl: PolygonImpl): PolygonImpl => ({
+  name: impl.name,
+  generate: (points, o, seed) => impl.generate(points, o, seed).slice(),
+});
+const slicedPath = (impl: PathImpl): PathImpl => ({
+  name: impl.name,
+  generate: (d, o, seed) => impl.generate(d, o, seed).slice(),
+});
+
 // The candidates under test. wasm-view first ("the champion").
 export const rectangleImpls: ShapeImpl[] = [sliced(wasmShapes.rectangle), jsRect];
 export const ellipseImpls: ShapeImpl[] = [sliced(wasmShapes.ellipse), jsEllipse];
+export const lineImpls: LineImpl[] = [slicedLine(wasmShapes.line), jsLine];
+export const polygonImpls: PolygonImpl[] = [slicedPolygon(wasmShapes.polygon), jsPolygon];
+export const pathImpls: PathImpl[] = [slicedPath(wasmShapes.path), jsPath];

@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>RoughJS Polygon Perf: JS vs Rust/WASM</title>
+    <style>
+      html { background: black; }
+      body { font-family: monospace; background: black; color: white; }
+      #results { white-space: pre; margin-bottom: 12px; line-height: 1.4; }
+    </style>
+  </head>
+  <body>
+    <div id="results">Loading WASM…</div>
+    <canvas width="800" height="800"></canvas>
+
+    <script type="module">
+      import rough from "../../bundled/rough.esm.js";
+      import init, { generate_polygons, generate_polygons_view, bench_polygons } from "./rough-wasm/pkg/rough_wasm.js";
+      import { genPolygonsFlat, drawOpBuffer, OP_STRIDE } from "./flat-js.mjs";
+
+      const COUNT = 4000, RUNS = 10, WIDTH = 800, HEIGHT = 800, SEED = 1, VERTS = 5;
+      const ROUGHNESS = 1, MAX_RAND = 2, BOWING = 1, PV = false, DMS = false;
+      const MAX_OPS = VERTS * 8; // VERTS closed edges x 2 strokes x 2 ops, with headroom
+
+      const ctx = document.querySelector("canvas").getContext("2d");
+      const rc = rough.canvas(document.querySelector("canvas"));
+      const results = document.getElementById("results");
+      const avg = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+
+      function randomPolygons() {
+        const p = new Float64Array(COUNT * VERTS * 2);
+        for (let i = 0; i < COUNT; i++) {
+          const cx = 60 + Math.random() * (WIDTH - 120);
+          const cy = 60 + Math.random() * (HEIGHT - 120);
+          const rad = 20 + Math.random() * 40;
+          const base = i * VERTS * 2;
+          for (let v = 0; v < VERTS; v++) {
+            const ang = (Math.PI * 2 * v) / VERTS;
+            p[base + v * 2] = cx + rad * Math.cos(ang);
+            p[base + v * 2 + 1] = cy + rad * Math.sin(ang);
+          }
+        }
+        return p;
+      }
+
+      async function run() {
+        await init();
+        const jsT = [], jfT = [], wcT = [], wvT = [], wpT = [];
+        let lastView = null;
+        const flatBuf = new Float64Array(COUNT * MAX_OPS * OP_STRIDE);
+        const oFlat = { roughness: ROUGHNESS, maxRandomnessOffset: MAX_RAND, bowing: BOWING, preserveVertices: PV, disableMultiStroke: DMS };
+        const args = (p) => [p, VERTS, ROUGHNESS, MAX_RAND, BOWING, PV, DMS, SEED];
+
+        for (let r = 0; r < RUNS; r++) {
+          const points = randomPolygons();
+          const opts = { seed: SEED, roughness: ROUGHNESS, maxRandomnessOffset: MAX_RAND, bowing: BOWING, preserveVertices: PV, disableMultiStroke: DMS };
+
+          let t = performance.now();
+          for (let i = 0; i < COUNT; i++) {
+            const base = i * VERTS * 2;
+            const pts = [];
+            for (let v = 0; v < VERTS; v++) pts.push([points[base + v * 2], points[base + v * 2 + 1]]);
+            rc.generator.polygon(pts, opts);
+          }
+          jsT.push(performance.now() - t);
+
+          t = performance.now();
+          genPolygonsFlat(points, VERTS, flatBuf, oFlat, SEED);
+          jfT.push(performance.now() - t);
+
+          t = performance.now(); generate_polygons(...args(points)); wcT.push(performance.now() - t);
+          t = performance.now(); bench_polygons(...args(points)); wpT.push(performance.now() - t);
+          t = performance.now(); lastView = generate_polygons_view(...args(points)); wvT.push(performance.now() - t);
+        }
+
+        drawOpBuffer(ctx, lastView, WIDTH, HEIGHT);
+
+        const js = avg(jsT), jf = avg(jfT), wc = avg(wcT), wv = avg(wvT), wp = avg(wpT);
+        const sp = (a, b) => (a / b).toFixed(2) + "x";
+        results.textContent = [
+          `Polygons:            ${COUNT} (${VERTS}-gon)   Runs: ${RUNS} (avg)   Seed: ${SEED}`,
+          ``,
+          `JS rough.js (objs):  ${js.toFixed(2)} ms`,
+          `JS flat Float64Arr:  ${jf.toFixed(2)} ms  -> ${sp(js, jf)} vs rough.js`,
+          `WASM gen (copy):     ${wc.toFixed(2)} ms  -> ${sp(js, wc)} vs rough.js`,
+          `WASM gen (view):     ${wv.toFixed(2)} ms  -> ${sp(js, wv)} vs rough.js`,
+          `WASM gen (pure):     ${wp.toFixed(2)} ms  -> ${sp(js, wp)} vs rough.js`,
+          ``,
+          `Note: JS rough.js also builds a points array per polygon here (unavoidable in its API).`,
+          `Honest language comparison (WASM view vs JS flat): ${sp(jf, wv)}`,
+        ].join("\n");
+        console.log(results.textContent);
+      }
+      run().catch((e) => { results.textContent = "Error: " + e; console.error(e); });
+    </script>
+  </body>
+</html>

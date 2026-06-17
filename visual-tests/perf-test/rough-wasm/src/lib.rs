@@ -467,6 +467,753 @@ pub fn bench_ellipses(
     checksum
 }
 
+// --- line / linearPath / polygon (renderer.ts line / linearPath / polygon) ---
+
+/// Port of renderer.ts `linearPath`.
+fn linear_path_into(points: &[(f64, f64)], close: bool, rng: &mut Random, o: &Options, out: &mut Vec<f64>) {
+    let len = points.len();
+    if len > 2 {
+        for i in 0..(len - 1) {
+            double_line(points[i].0, points[i].1, points[i + 1].0, points[i + 1].1, rng, o, out);
+        }
+        if close {
+            double_line(points[len - 1].0, points[len - 1].1, points[0].0, points[0].1, rng, o, out);
+        }
+    } else if len == 2 {
+        // renderer.ts: linearPath(len==2) delegates to line() == _doubleLine.
+        double_line(points[0].0, points[0].1, points[1].0, points[1].1, rng, o, out);
+    }
+}
+
+/// `coords` is a flat [x1,y1,x2,y2, ...] buffer — one line segment per 4 values.
+fn fill_lines(out: &mut Vec<f64>, coords: &[f64], o: &Options, seed: i32) {
+    out.clear();
+    let mut rng = Random { seed };
+    let n = coords.len() / 4;
+    for i in 0..n {
+        let b = i * 4;
+        double_line(coords[b], coords[b + 1], coords[b + 2], coords[b + 3], &mut rng, o, out);
+    }
+}
+
+/// `points` is a flat [x,y, ...] buffer of `verts`-vertex polygons laid end to end.
+fn fill_polygons(out: &mut Vec<f64>, points: &[f64], verts: usize, o: &Options, seed: i32) {
+    out.clear();
+    let mut rng = Random { seed };
+    if verts == 0 {
+        return;
+    }
+    let n = points.len() / (verts * 2);
+    let mut buf: Vec<(f64, f64)> = Vec::with_capacity(verts);
+    for p in 0..n {
+        buf.clear();
+        let base = p * verts * 2;
+        for v in 0..verts {
+            buf.push((points[base + v * 2], points[base + v * 2 + 1]));
+        }
+        linear_path_into(&buf, true, &mut rng, o, out);
+    }
+}
+
+// --- SVG path: parser + absolutize + normalize + svgPath (path-data-parser + renderer.ts) ---
+
+struct Seg {
+    key: u8, // ASCII command
+    data: Vec<f64>,
+}
+
+fn params_count(c: u8) -> i32 {
+    match c {
+        b'A' | b'a' => 7,
+        b'C' | b'c' => 6,
+        b'H' | b'h' => 1,
+        b'L' | b'l' => 2,
+        b'M' | b'm' => 2,
+        b'Q' | b'q' => 4,
+        b'S' | b's' => 4,
+        b'T' | b't' => 2,
+        b'V' | b'v' => 1,
+        b'Z' | b'z' => 0,
+        _ => -1,
+    }
+}
+
+enum Tok {
+    Cmd(u8),
+    Num(f64),
+}
+
+/// Length of a leading SVG number, matching path-data-parser's tokenizer regex.
+fn scan_number(b: &[u8]) -> Option<usize> {
+    let n = b.len();
+    let mut i = 0;
+    if i < n && (b[i] == b'+' || b[i] == b'-') {
+        i += 1;
+    }
+    let mut has_int = false;
+    while i < n && b[i].is_ascii_digit() {
+        i += 1;
+        has_int = true;
+    }
+    if has_int {
+        if i < n && b[i] == b'.' {
+            i += 1;
+            while i < n && b[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+    } else if i < n && b[i] == b'.' {
+        i += 1;
+        let fs = i;
+        while i < n && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == fs {
+            return None;
+        }
+    } else {
+        return None;
+    }
+    if i < n && (b[i] == b'e' || b[i] == b'E') {
+        let save = i;
+        i += 1;
+        if i < n && (b[i] == b'+' || b[i] == b'-') {
+            i += 1;
+        }
+        let es = i;
+        while i < n && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == es {
+            i = save; // exponent needs digits; otherwise exclude it
+        }
+    }
+    Some(i)
+}
+
+fn tokenize(d: &str) -> Option<Vec<Tok>> {
+    let b = d.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    let mut toks = Vec::new();
+    while i < n {
+        let c = b[i];
+        if c == b' ' || c == b'\t' || c == b'\r' || c == b'\n' || c == b',' {
+            i += 1;
+        } else if c.is_ascii_alphabetic() && params_count(c) >= 0 {
+            toks.push(Tok::Cmd(c));
+            i += 1;
+        } else if let Some(len) = scan_number(&b[i..]) {
+            let v: f64 = d[i..i + len].parse().ok()?;
+            toks.push(Tok::Num(v));
+            i += len;
+        } else {
+            return None; // matches JS tokenize() returning []
+        }
+    }
+    Some(toks)
+}
+
+/// Port of path-data-parser `parsePath`.
+fn parse_path(d: &str) -> Vec<Seg> {
+    let toks = tokenize(d).unwrap_or_default();
+    let len = toks.len();
+    let mut segments: Vec<Seg> = Vec::new();
+    let mut mode: u8 = 0; // 0 == BOD sentinel
+    let mut index = 0usize;
+    while index < len {
+        let params_n;
+        match &toks[index] {
+            _ if mode == 0 => match &toks[index] {
+                Tok::Cmd(c) if *c == b'M' || *c == b'm' => {
+                    index += 1;
+                    params_n = params_count(*c);
+                    mode = *c;
+                }
+                _ => {
+                    let mut s = String::from("M0,0");
+                    s.push_str(d);
+                    return parse_path(&s);
+                }
+            },
+            Tok::Num(_) => {
+                params_n = params_count(mode);
+            }
+            Tok::Cmd(c) => {
+                index += 1;
+                params_n = params_count(*c);
+                mode = *c;
+            }
+        }
+        // JS: (index + paramsCount) < tokens.length, tokens includes EOD (len+1).
+        if (index as i32 + params_n) as usize <= len {
+            let mut params: Vec<f64> = Vec::with_capacity(params_n.max(0) as usize);
+            for t in toks.iter().skip(index).take(params_n as usize) {
+                if let Tok::Num(v) = t {
+                    params.push(*v);
+                } else {
+                    return segments; // JS throws; we stop
+                }
+            }
+            segments.push(Seg { key: mode, data: params });
+            index += params_n as usize;
+            if mode == b'M' {
+                mode = b'L';
+            }
+            if mode == b'm' {
+                mode = b'l';
+            }
+        } else {
+            break; // "Path data ended short"
+        }
+    }
+    segments
+}
+
+/// Port of path-data-parser `absolutize`.
+fn absolutize(segments: &[Seg]) -> Vec<Seg> {
+    let (mut cx, mut cy) = (0.0, 0.0);
+    let (mut subx, mut suby) = (0.0, 0.0);
+    let mut out: Vec<Seg> = Vec::new();
+    for s in segments {
+        let d = &s.data;
+        match s.key {
+            b'M' => {
+                out.push(Seg { key: b'M', data: d.clone() });
+                cx = d[0];
+                cy = d[1];
+                subx = d[0];
+                suby = d[1];
+            }
+            b'm' => {
+                cx += d[0];
+                cy += d[1];
+                out.push(Seg { key: b'M', data: vec![cx, cy] });
+                subx = cx;
+                suby = cy;
+            }
+            b'L' => {
+                out.push(Seg { key: b'L', data: d.clone() });
+                cx = d[0];
+                cy = d[1];
+            }
+            b'l' => {
+                cx += d[0];
+                cy += d[1];
+                out.push(Seg { key: b'L', data: vec![cx, cy] });
+            }
+            b'C' => {
+                out.push(Seg { key: b'C', data: d.clone() });
+                cx = d[4];
+                cy = d[5];
+            }
+            b'c' => {
+                let nd: Vec<f64> = d.iter().enumerate().map(|(i, v)| if i % 2 == 1 { v + cy } else { v + cx }).collect();
+                cx = nd[4];
+                cy = nd[5];
+                out.push(Seg { key: b'C', data: nd });
+            }
+            b'Q' => {
+                out.push(Seg { key: b'Q', data: d.clone() });
+                cx = d[2];
+                cy = d[3];
+            }
+            b'q' => {
+                let nd: Vec<f64> = d.iter().enumerate().map(|(i, v)| if i % 2 == 1 { v + cy } else { v + cx }).collect();
+                cx = nd[2];
+                cy = nd[3];
+                out.push(Seg { key: b'Q', data: nd });
+            }
+            b'A' => {
+                out.push(Seg { key: b'A', data: d.clone() });
+                cx = d[5];
+                cy = d[6];
+            }
+            b'a' => {
+                cx += d[5];
+                cy += d[6];
+                out.push(Seg { key: b'A', data: vec![d[0], d[1], d[2], d[3], d[4], cx, cy] });
+            }
+            b'H' => {
+                out.push(Seg { key: b'H', data: d.clone() });
+                cx = d[0];
+            }
+            b'h' => {
+                cx += d[0];
+                out.push(Seg { key: b'H', data: vec![cx] });
+            }
+            b'V' => {
+                out.push(Seg { key: b'V', data: d.clone() });
+                cy = d[0];
+            }
+            b'v' => {
+                cy += d[0];
+                out.push(Seg { key: b'V', data: vec![cy] });
+            }
+            b'S' => {
+                out.push(Seg { key: b'S', data: d.clone() });
+                cx = d[2];
+                cy = d[3];
+            }
+            b's' => {
+                let nd: Vec<f64> = d.iter().enumerate().map(|(i, v)| if i % 2 == 1 { v + cy } else { v + cx }).collect();
+                cx = nd[2];
+                cy = nd[3];
+                out.push(Seg { key: b'S', data: nd });
+            }
+            b'T' => {
+                out.push(Seg { key: b'T', data: d.clone() });
+                cx = d[0];
+                cy = d[1];
+            }
+            b't' => {
+                cx += d[0];
+                cy += d[1];
+                out.push(Seg { key: b'T', data: vec![cx, cy] });
+            }
+            b'Z' | b'z' => {
+                out.push(Seg { key: b'Z', data: vec![] });
+                cx = subx;
+                cy = suby;
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[inline]
+fn rotate(x: f64, y: f64, angle: f64) -> (f64, f64) {
+    (x * angle.cos() - y * angle.sin(), x * angle.sin() + y * angle.cos())
+}
+
+#[inline]
+fn round9(v: f64) -> f64 {
+    (v * 1e9).round() / 1e9
+}
+
+/// Port of path-data-parser arc-to-cubic, returning control points in the rotated frame.
+#[allow(clippy::too_many_arguments)]
+fn arc_points(
+    mut x1: f64,
+    mut y1: f64,
+    mut x2: f64,
+    mut y2: f64,
+    mut r1: f64,
+    mut r2: f64,
+    angle_deg: f64,
+    large: bool,
+    sweep: bool,
+    recursive: Option<(f64, f64, f64, f64)>,
+) -> Vec<[f64; 2]> {
+    use std::f64::consts::PI;
+    let angle_rad = PI * angle_deg / 180.0;
+    let (f1, mut f2, cx, cy);
+    if let Some((rf1, rf2, rcx, rcy)) = recursive {
+        f1 = rf1;
+        f2 = rf2;
+        cx = rcx;
+        cy = rcy;
+    } else {
+        let p1 = rotate(x1, y1, -angle_rad);
+        x1 = p1.0;
+        y1 = p1.1;
+        let p2 = rotate(x2, y2, -angle_rad);
+        x2 = p2.0;
+        y2 = p2.1;
+        let x = (x1 - x2) / 2.0;
+        let y = (y1 - y2) / 2.0;
+        let mut h = (x * x) / (r1 * r1) + (y * y) / (r2 * r2);
+        if h > 1.0 {
+            h = h.sqrt();
+            r1 *= h;
+            r2 *= h;
+        }
+        let sign = if large == sweep { -1.0 } else { 1.0 };
+        let r1p = r1 * r1;
+        let r2p = r2 * r2;
+        let left = r1p * r2p - r1p * y * y - r2p * x * x;
+        let right = r1p * y * y + r2p * x * x;
+        let k = sign * (left / right).abs().sqrt();
+        let cxv = k * r1 * y / r2 + (x1 + x2) / 2.0;
+        let cyv = k * -r2 * x / r1 + (y1 + y2) / 2.0;
+        let mut f1v = round9((y1 - cyv) / r2).asin();
+        let mut f2v = round9((y2 - cyv) / r2).asin();
+        if x1 < cxv {
+            f1v = PI - f1v;
+        }
+        if x2 < cxv {
+            f2v = PI - f2v;
+        }
+        if f1v < 0.0 {
+            f1v += PI * 2.0;
+        }
+        if f2v < 0.0 {
+            f2v += PI * 2.0;
+        }
+        if sweep && f1v > f2v {
+            f1v -= PI * 2.0;
+        }
+        if !sweep && f2v > f1v {
+            f2v -= PI * 2.0;
+        }
+        f1 = f1v;
+        f2 = f2v;
+        cx = cxv;
+        cy = cyv;
+    }
+    let mut df = f2 - f1;
+    let mut params: Vec<[f64; 2]> = Vec::new();
+    if df.abs() > (PI * 120.0 / 180.0) {
+        let f2old = f2;
+        let x2old = x2;
+        let y2old = y2;
+        if sweep && f2 > f1 {
+            f2 = f1 + (PI * 120.0 / 180.0);
+        } else {
+            f2 = f1 - (PI * 120.0 / 180.0);
+        }
+        x2 = cx + r1 * f2.cos();
+        y2 = cy + r2 * f2.sin();
+        params = arc_points(x2, y2, x2old, y2old, r1, r2, angle_deg, false, sweep, Some((f2, f2old, cx, cy)));
+    }
+    df = f2 - f1;
+    let c1 = f1.cos();
+    let s1 = f1.sin();
+    let c2 = f2.cos();
+    let s2 = f2.sin();
+    let t = (df / 4.0).tan();
+    let hx = 4.0 / 3.0 * r1 * t;
+    let hy = 4.0 / 3.0 * r2 * t;
+    let m1 = [x1, y1];
+    let mut m2 = [x1 + hx * s1, y1 - hy * c1];
+    let m3 = [x2 + hx * s2, y2 - hy * c2];
+    let m4 = [x2, y2];
+    m2[0] = 2.0 * m1[0] - m2[0];
+    m2[1] = 2.0 * m1[1] - m2[1];
+    let mut out = vec![m2, m3, m4];
+    out.extend(params);
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arc_to_cubic_curves(x1: f64, y1: f64, x2: f64, y2: f64, r1: f64, r2: f64, angle_deg: f64, large: bool, sweep: bool) -> Vec<[f64; 6]> {
+    use std::f64::consts::PI;
+    let angle_rad = PI * angle_deg / 180.0;
+    let pts = arc_points(x1, y1, x2, y2, r1, r2, angle_deg, large, sweep, None);
+    let mut curves: Vec<[f64; 6]> = Vec::new();
+    let mut i = 0;
+    while i + 3 <= pts.len() {
+        let a = rotate(pts[i][0], pts[i][1], angle_rad);
+        let b = rotate(pts[i + 1][0], pts[i + 1][1], angle_rad);
+        let c = rotate(pts[i + 2][0], pts[i + 2][1], angle_rad);
+        curves.push([a.0, a.1, b.0, b.1, c.0, c.1]);
+        i += 3;
+    }
+    curves
+}
+
+/// Port of path-data-parser `normalize` (outputs only M, L, C, Z).
+fn normalize(segments: &[Seg]) -> Vec<Seg> {
+    let mut out: Vec<Seg> = Vec::new();
+    let mut last_type: u8 = 0;
+    let (mut cx, mut cy) = (0.0, 0.0);
+    let (mut subx, mut suby) = (0.0, 0.0);
+    let (mut lcx, mut lcy) = (0.0, 0.0);
+    for s in segments {
+        let d = &s.data;
+        match s.key {
+            b'M' => {
+                out.push(Seg { key: b'M', data: d.clone() });
+                cx = d[0];
+                cy = d[1];
+                subx = d[0];
+                suby = d[1];
+            }
+            b'C' => {
+                out.push(Seg { key: b'C', data: d.clone() });
+                cx = d[4];
+                cy = d[5];
+                lcx = d[2];
+                lcy = d[3];
+            }
+            b'L' => {
+                out.push(Seg { key: b'L', data: d.clone() });
+                cx = d[0];
+                cy = d[1];
+            }
+            b'H' => {
+                cx = d[0];
+                out.push(Seg { key: b'L', data: vec![cx, cy] });
+            }
+            b'V' => {
+                cy = d[0];
+                out.push(Seg { key: b'L', data: vec![cx, cy] });
+            }
+            b'S' => {
+                let (cx1, cy1) = if last_type == b'C' || last_type == b'S' {
+                    (cx + (cx - lcx), cy + (cy - lcy))
+                } else {
+                    (cx, cy)
+                };
+                out.push(Seg { key: b'C', data: vec![cx1, cy1, d[0], d[1], d[2], d[3]] });
+                lcx = d[0];
+                lcy = d[1];
+                cx = d[2];
+                cy = d[3];
+            }
+            b'T' => {
+                let (x, y) = (d[0], d[1]);
+                let (x1, y1) = if last_type == b'Q' || last_type == b'T' {
+                    (cx + (cx - lcx), cy + (cy - lcy))
+                } else {
+                    (cx, cy)
+                };
+                let cx1 = cx + 2.0 * (x1 - cx) / 3.0;
+                let cy1 = cy + 2.0 * (y1 - cy) / 3.0;
+                let cx2 = x + 2.0 * (x1 - x) / 3.0;
+                let cy2 = y + 2.0 * (y1 - y) / 3.0;
+                out.push(Seg { key: b'C', data: vec![cx1, cy1, cx2, cy2, x, y] });
+                lcx = x1;
+                lcy = y1;
+                cx = x;
+                cy = y;
+            }
+            b'Q' => {
+                let (x1, y1, x, y) = (d[0], d[1], d[2], d[3]);
+                let cx1 = cx + 2.0 * (x1 - cx) / 3.0;
+                let cy1 = cy + 2.0 * (y1 - cy) / 3.0;
+                let cx2 = x + 2.0 * (x1 - x) / 3.0;
+                let cy2 = y + 2.0 * (y1 - y) / 3.0;
+                out.push(Seg { key: b'C', data: vec![cx1, cy1, cx2, cy2, x, y] });
+                lcx = x1;
+                lcy = y1;
+                cx = x;
+                cy = y;
+            }
+            b'A' => {
+                let r1 = d[0].abs();
+                let r2 = d[1].abs();
+                let angle = d[2];
+                let large = d[3] != 0.0;
+                let sweep = d[4] != 0.0;
+                let x = d[5];
+                let y = d[6];
+                if r1 == 0.0 || r2 == 0.0 {
+                    out.push(Seg { key: b'C', data: vec![cx, cy, x, y, x, y] });
+                    cx = x;
+                    cy = y;
+                } else if cx != x || cy != y {
+                    for c in arc_to_cubic_curves(cx, cy, x, y, r1, r2, angle, large, sweep) {
+                        out.push(Seg { key: b'C', data: c.to_vec() });
+                    }
+                    cx = x;
+                    cy = y;
+                }
+            }
+            b'Z' => {
+                out.push(Seg { key: b'Z', data: vec![] });
+                cx = subx;
+                cy = suby;
+            }
+            _ => {}
+        }
+        last_type = s.key;
+    }
+    out
+}
+
+/// Port of renderer.ts `_bezierTo`.
+#[allow(clippy::too_many_arguments)]
+fn bezier_to(x1: f64, y1: f64, x2: f64, y2: f64, x: f64, y: f64, current: (f64, f64), rng: &mut Random, o: &Options, out: &mut Vec<f64>) {
+    let base = if o.max_randomness_offset != 0.0 { o.max_randomness_offset } else { 1.0 };
+    let ros = [base, base + 0.3];
+    let iterations = if o.disable_multi_stroke { 1 } else { 2 };
+    let pv = o.preserve_vertices;
+    for i in 0..iterations {
+        if i == 0 {
+            emit_move(out, current.0, current.1);
+        } else {
+            emit_move(
+                out,
+                current.0 + if pv { 0.0 } else { offset_opt(ros[0], rng, o, 1.0) },
+                current.1 + if pv { 0.0 } else { offset_opt(ros[0], rng, o, 1.0) },
+            );
+        }
+        let f = if pv {
+            (x, y)
+        } else {
+            (x + offset_opt(ros[i], rng, o, 1.0), y + offset_opt(ros[i], rng, o, 1.0))
+        };
+        emit_bcurve(
+            out,
+            x1 + offset_opt(ros[i], rng, o, 1.0),
+            y1 + offset_opt(ros[i], rng, o, 1.0),
+            x2 + offset_opt(ros[i], rng, o, 1.0),
+            y2 + offset_opt(ros[i], rng, o, 1.0),
+            f.0,
+            f.1,
+        );
+    }
+}
+
+/// renderer.ts `svgPath`: emit ops for a (preprocessed) SVG path string.
+fn svg_path_into(d: &str, rng: &mut Random, o: &Options, out: &mut Vec<f64>) {
+    let segs = normalize(&absolutize(&parse_path(d)));
+    let mut first = (0.0, 0.0);
+    let mut current = (0.0, 0.0);
+    for s in &segs {
+        match s.key {
+            b'M' => {
+                current = (s.data[0], s.data[1]);
+                first = current;
+            }
+            b'L' => {
+                double_line(current.0, current.1, s.data[0], s.data[1], rng, o, out);
+                current = (s.data[0], s.data[1]);
+            }
+            b'C' => {
+                let d = &s.data;
+                bezier_to(d[0], d[1], d[2], d[3], d[4], d[5], current, rng, o, out);
+                current = (d[4], d[5]);
+            }
+            b'Z' => {
+                double_line(current.0, current.1, first.0, first.1, rng, o, out);
+                current = first;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// generator.ts `path()` preprocessing: newline -> space, then drop one whitespace char
+/// immediately after a '-' (the third JS replace is a no-op bug, so omitted).
+fn preprocess_path(d: &str) -> String {
+    let spaced = d.replace('\n', " ");
+    let b = spaced.as_bytes();
+    let mut out = String::with_capacity(spaced.len());
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        out.push(c as char);
+        if c == b'-' && i + 1 < b.len() {
+            let nx = b[i + 1];
+            if nx == b' ' || nx == b'\t' || nx == b'\r' || nx == b'\n' || nx == 0x0c || nx == 0x0b {
+                i += 2; // skip the one whitespace after '-'
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// One SVG path's stroke ops (no fill, default simplification). Port of generator.path stroke.
+fn path_into(d: &str, rng: &mut Random, o: &Options, out: &mut Vec<f64>) {
+    if d.is_empty() {
+        return;
+    }
+    let pd = preprocess_path(d);
+    svg_path_into(&pd, rng, o, out);
+}
+
+fn fill_paths(out: &mut Vec<f64>, d: &str, repeat: usize, o: &Options, seed: i32) {
+    out.clear();
+    let mut rng = Random { seed };
+    for _ in 0..repeat {
+        path_into(d, &mut rng, o, out);
+    }
+}
+
+// --- wasm exports for line / polygon / path (copy / view / pure) ---
+
+#[allow(clippy::too_many_arguments)]
+#[wasm_bindgen]
+pub fn generate_lines(coords: &[f64], roughness: f64, max_randomness_offset: f64, bowing: f64, preserve_vertices: bool, disable_multi_stroke: bool, seed: i32) -> Vec<f64> {
+    let o = make_opts(roughness, max_randomness_offset, bowing, preserve_vertices, disable_multi_stroke);
+    let mut out = Vec::new();
+    fill_lines(&mut out, coords, &o, seed);
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+#[wasm_bindgen]
+pub fn generate_lines_view(coords: &[f64], roughness: f64, max_randomness_offset: f64, bowing: f64, preserve_vertices: bool, disable_multi_stroke: bool, seed: i32) -> js_sys::Float64Array {
+    let o = make_opts(roughness, max_randomness_offset, bowing, preserve_vertices, disable_multi_stroke);
+    OUT.with(|cell| {
+        let mut out = cell.borrow_mut();
+        fill_lines(&mut out, coords, &o, seed);
+        unsafe { js_sys::Float64Array::view(&out) }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[wasm_bindgen]
+pub fn bench_lines(coords: &[f64], roughness: f64, max_randomness_offset: f64, bowing: f64, preserve_vertices: bool, disable_multi_stroke: bool, seed: i32) -> f64 {
+    let o = make_opts(roughness, max_randomness_offset, bowing, preserve_vertices, disable_multi_stroke);
+    let mut scratch = Vec::new();
+    fill_lines(&mut scratch, coords, &o, seed);
+    scratch.iter().sum()
+}
+
+#[allow(clippy::too_many_arguments)]
+#[wasm_bindgen]
+pub fn generate_polygons(points: &[f64], verts: usize, roughness: f64, max_randomness_offset: f64, bowing: f64, preserve_vertices: bool, disable_multi_stroke: bool, seed: i32) -> Vec<f64> {
+    let o = make_opts(roughness, max_randomness_offset, bowing, preserve_vertices, disable_multi_stroke);
+    let mut out = Vec::new();
+    fill_polygons(&mut out, points, verts, &o, seed);
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+#[wasm_bindgen]
+pub fn generate_polygons_view(points: &[f64], verts: usize, roughness: f64, max_randomness_offset: f64, bowing: f64, preserve_vertices: bool, disable_multi_stroke: bool, seed: i32) -> js_sys::Float64Array {
+    let o = make_opts(roughness, max_randomness_offset, bowing, preserve_vertices, disable_multi_stroke);
+    OUT.with(|cell| {
+        let mut out = cell.borrow_mut();
+        fill_polygons(&mut out, points, verts, &o, seed);
+        unsafe { js_sys::Float64Array::view(&out) }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[wasm_bindgen]
+pub fn bench_polygons(points: &[f64], verts: usize, roughness: f64, max_randomness_offset: f64, bowing: f64, preserve_vertices: bool, disable_multi_stroke: bool, seed: i32) -> f64 {
+    let o = make_opts(roughness, max_randomness_offset, bowing, preserve_vertices, disable_multi_stroke);
+    let mut scratch = Vec::new();
+    fill_polygons(&mut scratch, points, verts, &o, seed);
+    scratch.iter().sum()
+}
+
+#[allow(clippy::too_many_arguments)]
+#[wasm_bindgen]
+pub fn generate_path(d: &str, repeat: usize, roughness: f64, max_randomness_offset: f64, bowing: f64, preserve_vertices: bool, disable_multi_stroke: bool, seed: i32) -> Vec<f64> {
+    let o = make_opts(roughness, max_randomness_offset, bowing, preserve_vertices, disable_multi_stroke);
+    let mut out = Vec::new();
+    fill_paths(&mut out, d, repeat, &o, seed);
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+#[wasm_bindgen]
+pub fn generate_path_view(d: &str, repeat: usize, roughness: f64, max_randomness_offset: f64, bowing: f64, preserve_vertices: bool, disable_multi_stroke: bool, seed: i32) -> js_sys::Float64Array {
+    let o = make_opts(roughness, max_randomness_offset, bowing, preserve_vertices, disable_multi_stroke);
+    OUT.with(|cell| {
+        let mut out = cell.borrow_mut();
+        fill_paths(&mut out, d, repeat, &o, seed);
+        unsafe { js_sys::Float64Array::view(&out) }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[wasm_bindgen]
+pub fn bench_path(d: &str, repeat: usize, roughness: f64, max_randomness_offset: f64, bowing: f64, preserve_vertices: bool, disable_multi_stroke: bool, seed: i32) -> f64 {
+    let o = make_opts(roughness, max_randomness_offset, bowing, preserve_vertices, disable_multi_stroke);
+    let mut scratch = Vec::new();
+    fill_paths(&mut scratch, d, repeat, &o, seed);
+    scratch.iter().sum()
+}
+
 /// Fill `out` with the op buffer for a batch of rectangles. `rects` is a flat
 /// [x,y,w,h, ...] buffer. One shared RNG advances across all rects, mirroring how
 /// rough.js reuses the randomizer on the shared options object.

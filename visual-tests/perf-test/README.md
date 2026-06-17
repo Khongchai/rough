@@ -7,12 +7,15 @@ stroke-only `rectangle` path to test whether Rust speeds up generation.
 
 - `rectangle.html` — JS-only: generate + draw 6000 rectangles, averaged over 10 runs.
 - `compare.html` — rectangle: JS rough.js vs JS flat-buffer vs Rust/WASM, same inputs.
-- `ellipse.html` — ellipse: same five-way comparison as `compare.html`.
-- `rough-wasm/` — the Rust crate (port of `src/renderer.ts` rectangle + ellipse paths).
+- `ellipse.html`, `line.html`, `polygon.html`, `path.html` — the same five-way comparison
+  for each shape.
+- `flat-js.mjs` — shared pure-JS flat-buffer generators (line/polygon/path) for the pages.
+- `rough-wasm/` — the Rust crate: port of `src/renderer.ts` rectangle, ellipse, line,
+  linearPath/polygon, and the full SVG `path` (parser + absolutize + normalize + svgPath).
 
 ## Fidelity tests
 
-`src/rectangle.test.ts` and `src/ellipse.test.ts` (beside `generator.ts`) assert that both
+`src/{rectangle,ellipse,line,polygon,path}.test.ts` (beside `generator.ts`) assert that both
 candidate implementations — the Rust/WASM `*_view` (the champion) and the pure-JS
 flat-buffer port — produce op buffers matching rough.js's real generator (the oracle),
 within a float tolerance. Shared harness: `src/fidelity-impls.ts`, which consumes the

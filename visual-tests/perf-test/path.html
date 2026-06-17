@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>RoughJS Path Perf: JS vs Rust/WASM</title>
+    <style>
+      html { background: black; }
+      body { font-family: monospace; background: black; color: white; }
+      #results { white-space: pre; margin-bottom: 12px; line-height: 1.4; }
+    </style>
+  </head>
+  <body>
+    <div id="results">Loading WASM…</div>
+    <canvas width="800" height="800"></canvas>
+
+    <script type="module">
+      import rough from "../../bundled/rough.esm.js";
+      import init, { generate_path, generate_path_view, bench_path } from "./rough-wasm/pkg/rough_wasm.js";
+      import { genPathsFlat, drawOpBuffer, OP_STRIDE } from "./flat-js.mjs";
+
+      const COUNT = 4000, RUNS = 10, WIDTH = 800, HEIGHT = 800, SEED = 1;
+      const ROUGHNESS = 1, MAX_RAND = 2, BOWING = 1, PV = false, DMS = false;
+      // A representative path: moves, lines, cubic + smooth, quadratic + smooth, close.
+      const D = "M100 200 L300 200 L300 400 Z M120 250 C160 180 240 180 280 250 S360 360 320 420 M150 300 Q200 240 260 320 T380 300";
+      const MAX_OPS = 256; // generous headroom for the JS-flat buffer (one path's ops)
+
+      const ctx = document.querySelector("canvas").getContext("2d");
+      const rc = rough.canvas(document.querySelector("canvas"));
+      const results = document.getElementById("results");
+      const avg = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+
+      async function run() {
+        await init();
+        const jsT = [], jfT = [], wcT = [], wvT = [], wpT = [];
+        let lastView = null;
+        const flatBuf = new Float64Array(MAX_OPS * OP_STRIDE);
+        const oFlat = { roughness: ROUGHNESS, maxRandomnessOffset: MAX_RAND, bowing: BOWING, preserveVertices: PV, disableMultiStroke: DMS };
+        const args = [D, COUNT, ROUGHNESS, MAX_RAND, BOWING, PV, DMS, SEED];
+        const opts = { seed: SEED, roughness: ROUGHNESS, maxRandomnessOffset: MAX_RAND, bowing: BOWING, preserveVertices: PV, disableMultiStroke: DMS };
+
+        for (let r = 0; r < RUNS; r++) {
+          let t = performance.now();
+          for (let i = 0; i < COUNT; i++) rc.generator.path(D, opts);
+          jsT.push(performance.now() - t);
+
+          // genPathsFlat parses once per call, so loop repeat=1 x COUNT to parse COUNT
+          // times — matching rough.js (per-call) and WASM (fill_paths re-parses each repeat).
+          t = performance.now();
+          for (let i = 0; i < COUNT; i++) genPathsFlat(D, 1, flatBuf, oFlat, SEED);
+          jfT.push(performance.now() - t);
+
+          t = performance.now(); generate_path(...args); wcT.push(performance.now() - t);
+          t = performance.now(); bench_path(...args); wpT.push(performance.now() - t);
+          t = performance.now(); lastView = generate_path_view(...args); wvT.push(performance.now() - t);
+        }
+
+        drawOpBuffer(ctx, lastView, WIDTH, HEIGHT);
+
+        const js = avg(jsT), jf = avg(jfT), wc = avg(wcT), wv = avg(wvT), wp = avg(wpT);
+        const sp = (a, b) => (a / b).toFixed(2) + "x";
+        results.textContent = [
+          `Paths:               ${COUNT} (same d)   Runs: ${RUNS} (avg)   Seed: ${SEED}`,
+          `d = ${D}`,
+          ``,
+          `JS rough.js (objs):  ${js.toFixed(2)} ms`,
+          `JS flat Float64Arr:  ${jf.toFixed(2)} ms  -> ${sp(js, jf)} vs rough.js`,
+          `WASM gen (copy):     ${wc.toFixed(2)} ms  -> ${sp(js, wc)} vs rough.js`,
+          `WASM gen (view):     ${wv.toFixed(2)} ms  -> ${sp(js, wv)} vs rough.js`,
+          `WASM gen (pure):     ${wp.toFixed(2)} ms  -> ${sp(js, wp)} vs rough.js`,
+          ``,
+          `All three parse d on every iteration (${COUNT}x), so parsing cost is included fairly.`,
+          `Honest language comparison (WASM view vs JS flat): ${sp(jf, wv)}`,
+        ].join("\n");
+        console.log(results.textContent);
+      }
+      run().catch((e) => { results.textContent = "Error: " + e; console.error(e); });
+    </script>
+  </body>
+</html>
