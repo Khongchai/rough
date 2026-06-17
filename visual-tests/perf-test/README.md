@@ -10,6 +10,20 @@ stroke-only `rectangle` path to test whether Rust speeds up generation.
 - `ellipse.html` — ellipse: same five-way comparison as `compare.html`.
 - `rough-wasm/` — the Rust crate (port of `src/renderer.ts` rectangle + ellipse paths).
 
+## Fidelity tests
+
+`src/rectangle.test.ts` and `src/ellipse.test.ts` (beside `generator.ts`) assert that both
+candidate implementations — the Rust/WASM `*_view` (the champion) and the pure-JS
+flat-buffer port — produce op buffers matching rough.js's real generator (the oracle),
+within a float tolerance. Shared harness: `src/fidelity-impls.ts`.
+
+These need the **Node-target** WASM build (the browser `pkg/` won't load in Node):
+
+```bash
+cd visual-tests/perf-test/rough-wasm && wasm-pack build --target nodejs --out-dir pkg-node --release
+cd /Users/macguildfi/Desktop/work/rough && npm test
+```
+
 ## Build the WASM module
 
 ```bash

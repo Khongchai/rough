@@ -8,7 +8,7 @@
   "scripts": {
     "build": "rm -rf bin && tsc && rollup -c",
     "lint": "eslint --ext ts src",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "vitest run"
   },
   "repository": {
     "type": "git",
@@ -37,7 +37,8 @@
     "rollup": "^2.61.0",
     "rollup-plugin-terser": "^7.0.2",
     "tslib": "^2.3.1",
-    "typescript": "^4.5.3"
+    "typescript": "^4.5.3",
+    "vitest": "^2.1.9"
   },
   "dependencies": {
     "hachure-fill": "^0.5.2",
