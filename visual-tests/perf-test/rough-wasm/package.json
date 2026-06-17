@@ -1,0 +1,27 @@
+{
+  "name": "rough-wasm-shapes",
+  "version": "0.1.0",
+  "description": "Ergonomic ShapeImpl wrapper around the Rust/WASM RoughJS rectangle + ellipse generators.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.ts",
+      "default": "./index.ts"
+    },
+    "./core": {
+      "types": "./core.ts",
+      "default": "./core.ts"
+    }
+  },
+  "files": [
+    "index.ts",
+    "core.ts",
+    "pkg",
+    "src/lib.rs",
+    "Cargo.toml"
+  ],
+  "scripts": {
+    "build:wasm": "wasm-pack build --target web --release",
+    "build:wasm-node": "wasm-pack build --target nodejs --out-dir pkg-node --release"
+  }
+}

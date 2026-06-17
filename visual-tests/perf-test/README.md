@@ -15,14 +15,18 @@ stroke-only `rectangle` path to test whether Rust speeds up generation.
 `src/rectangle.test.ts` and `src/ellipse.test.ts` (beside `generator.ts`) assert that both
 candidate implementations — the Rust/WASM `*_view` (the champion) and the pure-JS
 flat-buffer port — produce op buffers matching rough.js's real generator (the oracle),
-within a float tolerance. Shared harness: `src/fidelity-impls.ts`.
+within a float tolerance. Shared harness: `src/fidelity-impls.ts`, which consumes the
+`ShapeImpl` API from the `rough-wasm/` package (`core.ts`).
 
 These need the **Node-target** WASM build (the browser `pkg/` won't load in Node):
 
 ```bash
-cd visual-tests/perf-test/rough-wasm && wasm-pack build --target nodejs --out-dir pkg-node --release
+cd visual-tests/perf-test/rough-wasm && npm run build:wasm-node
 cd /Users/macguildfi/Desktop/work/rough && npm test
 ```
+
+The ergonomic `ShapeImpl` wrapper (`load()`, `makeImpls`, `FlatOptions`, `DEFAULTS`) now
+lives in `rough-wasm/` so it can be linked as a package — see `rough-wasm/README.md`.
 
 ## Build the WASM module
 

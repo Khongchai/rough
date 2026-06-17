@@ -1,59 +1,33 @@
-// Shared test harness for the rectangle/ellipse fidelity tests.
+// Test harness for the rectangle/ellipse fidelity tests.
 //
-// Both the Rust/WASM port and the pure-JS flat-buffer port implement the same
-// interface: given a single shape + options + seed, produce a flat stride-7 op buffer
-// (encoding matches visual-tests/perf-test/rough-wasm/src/lib.rs). The fidelity oracle
-// is rough.js's real generator (src/generator.ts), decoded into the same flat format.
+// The WASM-facing API (ShapeImpl, FlatOptions, DEFAULTS, makeImpls) now lives in the
+// reusable package at visual-tests/perf-test/rough-wasm (core.ts). Here we:
+//   - feed the Node-target bindings into makeImpls to get the wasm-view impls,
+//   - keep the rough.js reference (the oracle) and the pure-JS flat-buffer port, which
+//     are test-only and don't belong in the shipped package.
 //
-// The WASM uses the Node-target build (visual-tests/perf-test/rough-wasm/pkg-node),
-// which loads synchronously in Node — unlike the `--target web` pkg used by the
-// browser perf pages. Rebuild it with:
-//   cd visual-tests/perf-test/rough-wasm && wasm-pack build --target nodejs --out-dir pkg-node --release
+// The Node-target WASM loads synchronously (unlike the browser `--target web` build).
+// Rebuild it with:
+//   cd visual-tests/perf-test/rough-wasm && npm run build:wasm-node
 
-import * as wasm from "../visual-tests/perf-test/rough-wasm/pkg-node/rough_wasm.js";
-import { OpSet, Options } from "./core.js";
-import { RoughGenerator } from "./generator.js";
+import * as nodeWasm from '../visual-tests/perf-test/rough-wasm/pkg-node/rough_wasm.js';
+import {
+  makeImpls,
+  DEFAULTS,
+  OP_STRIDE,
+  OP_MOVE,
+  OP_BCURVE,
+  OP_LINE,
+  type FlatOptions,
+  type ShapeImpl,
+  type RoughWasmExports,
+} from '../visual-tests/perf-test/rough-wasm/core.js';
+import { OpSet, Options } from './core.js';
+import { RoughGenerator } from './generator.js';
 
-// Op buffer encoding (must match the Rust lib + the browser perf pages).
-export const OP_STRIDE = 7;
-export const OP_MOVE = 0;
-export const OP_BCURVE = 1;
-export const OP_LINE = 2;
-
-export interface FlatOptions {
-  roughness: number;
-  maxRandomnessOffset: number;
-  bowing: number;
-  preserveVertices: boolean;
-  disableMultiStroke: boolean;
-  curveStepCount: number;
-  curveFitting: number;
-  curveTightness: number;
-}
-
-export const DEFAULTS: FlatOptions = {
-  roughness: 1,
-  maxRandomnessOffset: 2,
-  bowing: 1,
-  preserveVertices: false,
-  disableMultiStroke: false,
-  curveStepCount: 9,
-  curveFitting: 0.95,
-  curveTightness: 0,
-};
-
-/** A candidate implementation: single shape -> flat stride-7 op buffer. */
-export interface ShapeImpl {
-  name: string;
-  generate(
-    x: number,
-    y: number,
-    w: number,
-    h: number,
-    o: FlatOptions,
-    seed: number,
-  ): Float64Array;
-}
+// Re-export the package surface so the test files can import everything from here.
+export { DEFAULTS, OP_STRIDE, OP_MOVE, OP_BCURVE, OP_LINE };
+export type { FlatOptions, ShapeImpl };
 
 // --- rough.js reference (the oracle) ---
 
@@ -78,86 +52,33 @@ function flatten(sets: OpSet[]): Float64Array {
   const out: number[] = [];
   for (const set of sets) {
     for (const op of set.ops) {
-      const code =
-        op.op === "move" ? OP_MOVE : op.op === "bcurveTo" ? OP_BCURVE : OP_LINE;
+      const code = op.op === 'move' ? OP_MOVE : op.op === 'bcurveTo' ? OP_BCURVE : OP_LINE;
       const d = op.data;
-      out.push(
-        code,
-        d[0] ?? 0,
-        d[1] ?? 0,
-        d[2] ?? 0,
-        d[3] ?? 0,
-        d[4] ?? 0,
-        d[5] ?? 0,
-      );
+      out.push(code, d[0] ?? 0, d[1] ?? 0, d[2] ?? 0, d[3] ?? 0, d[4] ?? 0, d[5] ?? 0);
     }
   }
   return new Float64Array(out);
 }
 
-export function referenceRectangle(
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  o: FlatOptions,
-  seed: number,
-): Float64Array {
+export function referenceRectangle(x: number, y: number, w: number, h: number, o: FlatOptions, seed: number): Float64Array {
   return flatten(gen.rectangle(x, y, w, h, toOptions(o, seed)).sets);
 }
 
-export function referenceEllipse(
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  o: FlatOptions,
-  seed: number,
-): Float64Array {
+export function referenceEllipse(x: number, y: number, w: number, h: number, o: FlatOptions, seed: number): Float64Array {
   return flatten(gen.ellipse(x, y, w, h, toOptions(o, seed)).sets);
 }
 
-// --- WASM (the champion: zero-copy view). .slice() snapshots the view, which aliases
-// WASM memory and is invalidated by the next call. ---
+// --- WASM champion (zero-copy view). The package returns a transient view; the tests
+// wrap it to snapshot via .slice() so held buffers survive later generate() calls. ---
 
-const wasmRect: ShapeImpl = {
-  name: "wasm-view",
-  generate(x, y, w, h, o, seed) {
-    return wasm
-      .generate_rectangles_view(
-        new Float64Array([x, y, w, h]),
-        o.roughness,
-        o.maxRandomnessOffset,
-        o.bowing,
-        o.preserveVertices,
-        o.disableMultiStroke,
-        seed,
-      )
-      .slice();
-  },
-};
+const wasmShapes = makeImpls(nodeWasm as unknown as RoughWasmExports);
 
-const wasmEllipse: ShapeImpl = {
-  name: "wasm-view",
-  generate(x, y, w, h, o, seed) {
-    return wasm
-      .generate_ellipses_view(
-        new Float64Array([x, y, w, h]),
-        o.roughness,
-        o.maxRandomnessOffset,
-        o.bowing,
-        o.preserveVertices,
-        o.disableMultiStroke,
-        o.curveStepCount,
-        o.curveFitting,
-        o.curveTightness,
-        seed,
-      )
-      .slice();
-  },
-};
+const sliced = (impl: ShapeImpl): ShapeImpl => ({
+  name: impl.name,
+  generate: (x, y, w, h, o, seed) => impl.generate(x, y, w, h, o, seed).slice(),
+});
 
-// --- Pure-JS flat-buffer port (mirrors the Rust lib; same as the browser perf pages) ---
+// --- Pure-JS flat-buffer port (test-only oracle-conforming second impl) ---
 
 class FlatRandom {
   seed: number;
@@ -170,28 +91,14 @@ class FlatRandom {
   }
 }
 
-function genRectangleFlatJS(
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  o: FlatOptions,
-  seed: number,
-): Float64Array {
+function genRectangleFlatJS(x: number, y: number, w: number, h: number, o: FlatOptions, seed: number): Float64Array {
   const rng = new FlatRandom(seed);
   const out: number[] = [];
 
-  const offset = (min: number, max: number, rg: number) =>
-    o.roughness * rg * (rng.next() * (max - min) + min);
+  const offset = (min: number, max: number, rg: number) => o.roughness * rg * (rng.next() * (max - min) + min);
   const offsetOpt = (v: number, rg: number) => offset(-v, v, rg);
 
-  function line(
-    x1: number,
-    y1: number,
-    x2: number,
-    y2: number,
-    overlay: boolean,
-  ) {
+  function line(x1: number, y1: number, x2: number, y2: number, overlay: boolean) {
     const lengthSq = (x1 - x2) ** 2 + (y1 - y2) ** 2;
     const length = Math.sqrt(lengthSq);
     let rg: number;
@@ -212,15 +119,7 @@ function genRectangleFlatJS(
     const pv = o.preserveVertices;
     const r = overlay ? halfOffset : off;
 
-    out.push(
-      OP_MOVE,
-      x1 + (pv ? 0 : offsetOpt(r, rg)),
-      y1 + (pv ? 0 : offsetOpt(r, rg)),
-      0,
-      0,
-      0,
-      0,
-    );
+    out.push(OP_MOVE, x1 + (pv ? 0 : offsetOpt(r, rg)), y1 + (pv ? 0 : offsetOpt(r, rg)), 0, 0, 0, 0);
     out.push(
       OP_BCURVE,
       midDispX + x1 + (x2 - x1) * divergePoint + offsetOpt(r, rg),
@@ -228,7 +127,7 @@ function genRectangleFlatJS(
       midDispX + x1 + 2 * (x2 - x1) * divergePoint + offsetOpt(r, rg),
       midDispY + y1 + 2 * (y2 - y1) * divergePoint + offsetOpt(r, rg),
       x2 + (pv ? 0 : offsetOpt(r, rg)),
-      y2 + (pv ? 0 : offsetOpt(r, rg)),
+      y2 + (pv ? 0 : offsetOpt(r, rg))
     );
   }
 
@@ -246,28 +145,16 @@ function genRectangleFlatJS(
   return new Float64Array(out);
 }
 
-function genEllipseFlatJS(
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  o: FlatOptions,
-  seed: number,
-): Float64Array {
+function genEllipseFlatJS(x: number, y: number, w: number, h: number, o: FlatOptions, seed: number): Float64Array {
   const rng = new FlatRandom(seed);
   const out: number[] = [];
 
-  const offset = (min: number, max: number) =>
-    o.roughness * (rng.next() * (max - min) + min);
+  const offset = (min: number, max: number) => o.roughness * (rng.next() * (max - min) + min);
   const offsetOpt = (v: number) => offset(-v, v);
 
   function ellipseParams(width: number, height: number) {
-    const psq = Math.sqrt(
-      Math.PI * 2 * Math.sqrt(((width / 2) ** 2 + (height / 2) ** 2) / 2),
-    );
-    const stepCount = Math.ceil(
-      Math.max(o.curveStepCount, (o.curveStepCount / Math.sqrt(200)) * psq),
-    );
+    const psq = Math.sqrt(Math.PI * 2 * Math.sqrt(((width / 2) ** 2 + (height / 2) ** 2) / 2));
+    const stepCount = Math.ceil(Math.max(o.curveStepCount, (o.curveStepCount / Math.sqrt(200)) * psq));
     const increment = (Math.PI * 2) / stepCount;
     let rx = Math.abs(width / 2);
     let ry = Math.abs(height / 2);
@@ -277,21 +164,12 @@ function genEllipseFlatJS(
     return { increment, rx, ry };
   }
 
-  function computeEllipsePoints(
-    increment: number,
-    cx: number,
-    cy: number,
-    rx: number,
-    ry: number,
-    off: number,
-    overlap: number,
-  ): number[][] {
+  function computeEllipsePoints(increment: number, cx: number, cy: number, rx: number, ry: number, off: number, overlap: number): number[][] {
     const all: number[][] = [];
     if (o.roughness === 0) {
       const inc = increment / 4;
       all.push([cx + rx * Math.cos(-inc), cy + ry * Math.sin(-inc)]);
-      for (let a = 0; a <= Math.PI * 2; a += inc)
-        all.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]);
+      for (let a = 0; a <= Math.PI * 2; a += inc) all.push([cx + rx * Math.cos(a), cy + ry * Math.sin(a)]);
       all.push([cx + rx, cy]);
       all.push([cx + rx * Math.cos(inc), cy + ry * Math.sin(inc)]);
     } else {
@@ -302,18 +180,11 @@ function genEllipseFlatJS(
       ]);
       const endAngle = Math.PI * 2 + radOffset - 0.01;
       for (let a = radOffset; a < endAngle; a += increment) {
-        all.push([
-          offsetOpt(off) + cx + rx * Math.cos(a),
-          offsetOpt(off) + cy + ry * Math.sin(a),
-        ]);
+        all.push([offsetOpt(off) + cx + rx * Math.cos(a), offsetOpt(off) + cy + ry * Math.sin(a)]);
       }
       all.push([
-        offsetOpt(off) +
-          cx +
-          rx * Math.cos(radOffset + Math.PI * 2 + overlap * 0.5),
-        offsetOpt(off) +
-          cy +
-          ry * Math.sin(radOffset + Math.PI * 2 + overlap * 0.5),
+        offsetOpt(off) + cx + rx * Math.cos(radOffset + Math.PI * 2 + overlap * 0.5),
+        offsetOpt(off) + cy + ry * Math.sin(radOffset + Math.PI * 2 + overlap * 0.5),
       ]);
       all.push([
         offsetOpt(off) + cx + 0.98 * rx * Math.cos(radOffset + overlap),
@@ -340,56 +211,28 @@ function genEllipseFlatJS(
           points[i + 1][0] + (s * points[i][0] - s * points[i + 2][0]) / 6,
           points[i + 1][1] + (s * points[i][1] - s * points[i + 2][1]) / 6,
           points[i + 1][0],
-          points[i + 1][1],
+          points[i + 1][1]
         );
       }
     } else if (len === 3) {
       out.push(OP_MOVE, points[1][0], points[1][1], 0, 0, 0, 0);
-      out.push(
-        OP_BCURVE,
-        points[1][0],
-        points[1][1],
-        points[2][0],
-        points[2][1],
-        points[2][0],
-        points[2][1],
-      );
+      out.push(OP_BCURVE, points[1][0], points[1][1], points[2][0], points[2][1], points[2][0], points[2][1]);
     }
   }
 
   const params = ellipseParams(w, h);
   const inner = offset(0.4, 1);
   const overlap = params.increment * offset(0.1, inner);
-  curve(
-    computeEllipsePoints(
-      params.increment,
-      x,
-      y,
-      params.rx,
-      params.ry,
-      1,
-      overlap,
-    ),
-  );
+  curve(computeEllipsePoints(params.increment, x, y, params.rx, params.ry, 1, overlap));
   if (!o.disableMultiStroke && o.roughness !== 0) {
-    curve(
-      computeEllipsePoints(
-        params.increment,
-        x,
-        y,
-        params.rx,
-        params.ry,
-        1.5,
-        0,
-      ),
-    );
+    curve(computeEllipsePoints(params.increment, x, y, params.rx, params.ry, 1.5, 0));
   }
   return new Float64Array(out);
 }
 
-const jsRect: ShapeImpl = { name: "js-flat", generate: genRectangleFlatJS };
-const jsEllipse: ShapeImpl = { name: "js-flat", generate: genEllipseFlatJS };
+const jsRect: ShapeImpl = { name: 'js-flat', generate: genRectangleFlatJS };
+const jsEllipse: ShapeImpl = { name: 'js-flat', generate: genEllipseFlatJS };
 
 // The candidates under test. wasm-view first ("the champion").
-export const rectangleImpls: ShapeImpl[] = [wasmRect, jsRect];
-export const ellipseImpls: ShapeImpl[] = [wasmEllipse, jsEllipse];
+export const rectangleImpls: ShapeImpl[] = [sliced(wasmShapes.rectangle), jsRect];
+export const ellipseImpls: ShapeImpl[] = [sliced(wasmShapes.ellipse), jsEllipse];
